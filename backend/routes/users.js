@@ -21,12 +21,21 @@ router.get('/me', auth, async (req, res) => {
 // GET /api/users/search?q=
 router.get('/search', auth, async (req, res) => {
   const q = (req.query.q ?? '').trim()
-  if (q.length < 2) return res.json([])
   try {
-    const [rows] = await db.query(
-      'SELECT id, name, role, points_balance FROM users WHERE name LIKE ? LIMIT 20',
-      [`%${q}%`]
-    )
+    let rows
+    if (!q) {
+      ;[rows] = await db.query(
+        'SELECT id, name, role, points_balance FROM users WHERE id != ? ORDER BY name LIMIT 12',
+        [req.user.id]
+      )
+    } else if (q.length < 2) {
+      return res.json([])
+    } else {
+      ;[rows] = await db.query(
+        'SELECT id, name, role, points_balance FROM users WHERE name LIKE ? AND id != ? LIMIT 20',
+        [`%${q}%`, req.user.id]
+      )
+    }
     res.json(rows)
   } catch (err) {
     console.error(err)

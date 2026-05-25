@@ -22,6 +22,7 @@ router.get('/', auth, async (req, res) => {
       ;[rows] = await db.query(
         `SELECT o.*, of.title AS offer_title, of.address AS pickup_address,
                 of.lat AS offer_lat, of.lng AS offer_lng,
+                of.transporter_points,
                 ug.address AS delivery_address
          FROM orders o
          JOIN offers of ON of.id = o.offer_id
@@ -52,12 +53,13 @@ router.get('/:id', auth, async (req, res) => {
     const [rows] = await db.query(
       `SELECT o.*,
               of.title AS offer_title, of.lat AS offer_lat, of.lng AS offer_lng,
-              of.address AS pickup_address, of.user_id AS restoranas_id,
+              COALESCE(of.address, ur.address) AS pickup_address, of.user_id AS restoranas_id,
               ug.address AS delivery_address, ug.name AS gavejas_name,
               (SELECT COUNT(*) FROM feedback WHERE order_id = o.id AND from_user_id = ? AND to_user_id = o.transportuotojas_id) AS has_feedback_transport,
               (SELECT COUNT(*) FROM feedback WHERE order_id = o.id AND from_user_id = ? AND to_user_id = of.user_id) AS has_feedback_restoranas
        FROM orders o
        JOIN offers of ON of.id = o.offer_id
+       JOIN users ur ON ur.id = of.user_id
        LEFT JOIN users ug ON ug.id = o.gavejas_id
        WHERE o.id = ?`,
       [req.user.id, req.user.id, req.params.id]
@@ -89,7 +91,7 @@ router.post('/', auth, async (req, res) => {
   if (!['gavejas', 'transportuotojas'].includes(req.user.role)) {
     return res.status(403).json({ message: 'Tik gavėjai gali pateikti užsakymus' })
   }
-  const { offer_id } = req.body
+  const { offer_id, delivery_lat, delivery_lng } = req.body
   if (!offer_id) return res.status(400).json({ message: 'offer_id privalomas' })
   try {
     const [offers] = await db.query(
@@ -107,8 +109,8 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ message: 'Jau pateikėte užsakymą šiam pasiūlymui' })
     }
     const [result] = await db.query(
-      "INSERT INTO orders (offer_id, gavejas_id, status) VALUES (?, ?, 'laukiama_patvirtinimo')",
-      [offer_id, req.user.id]
+      "INSERT INTO orders (offer_id, gavejas_id, status, delivery_lat, delivery_lng) VALUES (?, ?, 'laukiama_patvirtinimo', ?, ?)",
+      [offer_id, req.user.id, delivery_lat ?? null, delivery_lng ?? null]
     )
     const [rows] = await db.query('SELECT * FROM orders WHERE id = ?', [result.insertId])
     res.status(201).json(rows[0])
@@ -158,7 +160,7 @@ router.put('/:id/confirm', auth, async (req, res) => {
 router.put('/:id/confirm-delivery', auth, async (req, res) => {
   try {
     const [rows] = await db.query(
-      'SELECT o.*, of.user_id AS davejas_id FROM orders o JOIN offers of ON of.id = o.offer_id WHERE o.id = ?',
+      'SELECT o.*, of.user_id AS davejas_id, of.transporter_points FROM orders o JOIN offers of ON of.id = o.offer_id WHERE o.id = ?',
       [req.params.id]
     )
     if (rows.length === 0) return res.status(404).json({ message: 'Užsakymas nerastas' })
@@ -171,7 +173,6 @@ router.put('/:id/confirm-delivery', auth, async (req, res) => {
           "UPDATE orders SET status = 'pristatoma', transportuotojas_id = ? WHERE id = ?",
           [userId, order.id]
         )
-        // Transportuotojas gauna 20% (10 taškų) priėmęs užsakymą
         await db.query(
           "INSERT INTO points_transactions (user_id, order_id, amount, type) VALUES (?, ?, 10, 'priemimas')",
           [userId, order.id]
@@ -179,7 +180,7 @@ router.put('/:id/confirm-delivery', auth, async (req, res) => {
         await db.query('UPDATE users SET points_balance = points_balance + 10 WHERE id = ?', [userId])
       } else if (order.status === 'pristatoma' && order.transportuotojas_id === userId) {
         await db.query("UPDATE orders SET status = 'ivykdyta' WHERE id = ?", [order.id])
-        await addDeliverPoints(order.id, order.gavejas_id, userId, order.davejas_id)
+        await addDeliverPoints(order.id, order.gavejas_id, userId, order.davejas_id, order.transporter_points ?? 30)
       } else {
         return res.status(400).json({ message: 'Neteisinga būsena' })
       }
@@ -199,7 +200,7 @@ router.put('/:id/confirm-delivery', auth, async (req, res) => {
 router.put('/:id/confirm-receipt', auth, async (req, res) => {
   try {
     const [rows] = await db.query(
-      'SELECT o.*, of.user_id AS davejas_id FROM orders o JOIN offers of ON of.id = o.offer_id WHERE o.id = ?',
+      'SELECT o.*, of.user_id AS davejas_id, of.transporter_points FROM orders o JOIN offers of ON of.id = o.offer_id WHERE o.id = ?',
       [req.params.id]
     )
     if (rows.length === 0) return res.status(404).json({ message: 'Užsakymas nerastas' })
@@ -209,7 +210,7 @@ router.put('/:id/confirm-receipt', auth, async (req, res) => {
       return res.status(400).json({ message: 'Neteisinga būsena' })
     }
     await db.query("UPDATE orders SET status = 'ivykdyta' WHERE id = ?", [order.id])
-    await addDeliverPoints(order.id, order.gavejas_id, order.transportuotojas_id, order.davejas_id)
+    await addDeliverPoints(order.id, order.gavejas_id, order.transportuotojas_id, order.davejas_id, order.transporter_points ?? 30)
     const [updated] = await db.query('SELECT * FROM orders WHERE id = ?', [order.id])
     res.json(updated[0])
   } catch (err) {
@@ -249,8 +250,7 @@ router.put('/:id/decline', auth, async (req, res) => {
   }
 })
 
-// Transportuotojas: 60% (30 taškų) už pristatymą + davejas +10 + gavejas +5
-async function addDeliverPoints(orderId, gavejasId, transportuotojasId, davejasId) {
+async function addDeliverPoints(orderId, gavejasId, transportuotojasId, davejasId, transporterPoints = 30) {
   const conn = await require('../db').getConnection()
   try {
     await conn.beginTransaction()
@@ -269,12 +269,11 @@ async function addDeliverPoints(orderId, gavejasId, transportuotojasId, davejasI
       await conn.query('UPDATE users SET points_balance = points_balance + 5 WHERE id = ?', [gavejasId])
     }
     if (transportuotojasId) {
-      // 60% = 30 taškų
       await conn.query(
-        "INSERT INTO points_transactions (user_id, order_id, amount, type) VALUES (?, ?, 30, 'pristatymas')",
-        [transportuotojasId, orderId]
+        "INSERT INTO points_transactions (user_id, order_id, amount, type) VALUES (?, ?, ?, 'pristatymas')",
+        [transportuotojasId, orderId, transporterPoints]
       )
-      await conn.query('UPDATE users SET points_balance = points_balance + 30 WHERE id = ?', [transportuotojasId])
+      await conn.query('UPDATE users SET points_balance = points_balance + ? WHERE id = ?', [transporterPoints, transportuotojasId])
     }
     await conn.commit()
   } catch (err) {

@@ -107,15 +107,16 @@ router.post('/', auth, async (req, res) => {
   if (!['davejas', 'restoranas'].includes(req.user.role)) {
     return res.status(403).json({ message: 'Tik davėjai gali kurti pasiūlymus' })
   }
-  const { title, quantity, expires_at, lat, lng, address } = req.body
+  const { title, quantity, expires_at, lat, lng, address, transporter_points } = req.body
   if (!title || !quantity) {
     return res.status(400).json({ message: 'Pavadinimas ir kiekis privalomi' })
   }
   const expiresAt = expires_at || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ')
+  const tPoints = Math.max(1, parseInt(transporter_points, 10) || 30)
   try {
     const [result] = await db.query(
-      'INSERT INTO offers (user_id, title, quantity, expires_at, lat, lng, address) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [req.user.id, title, quantity, expiresAt, lat ?? null, lng ?? null, address ?? null]
+      'INSERT INTO offers (user_id, title, quantity, expires_at, lat, lng, address, transporter_points) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [req.user.id, title, quantity, expiresAt, lat ?? null, lng ?? null, address ?? null, tPoints]
     )
     const [rows] = await db.query('SELECT * FROM offers WHERE id = ?', [result.insertId])
     res.status(201).json(rows[0])

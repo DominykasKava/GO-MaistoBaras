@@ -2,20 +2,22 @@ const router = require('express').Router()
 const auth = require('../middleware/auth')
 const db = require('../db')
 
+const BONUS_PCT = { heart: 20, thumb: 10, alien: 0 }
+
 // POST /api/feedback
 router.post('/', auth, async (req, res) => {
   const { order_id, reviewed_user_id, rating, comment, target_type } = req.body
   if (!order_id || !reviewed_user_id || !rating) {
     return res.status(400).json({ message: 'order_id, reviewed_user_id ir rating privalomi' })
   }
-  const validRatings = ['heart', 'thumb', 'ok']
+  const validRatings = ['heart', 'thumb', 'ok', 'alien']
   if (!validRatings.includes(rating)) {
     return res.status(400).json({ message: 'Netinkamas įvertinimas' })
   }
   try {
     // Verify caller participated in this order and reviewed_user_id is the other party
     const [[order]] = await db.query(
-      `SELECT o.gavejas_id, o.transportuotojas_id, of.user_id AS restoranas_id
+      `SELECT o.gavejas_id, o.transportuotojas_id, of.user_id AS restoranas_id, of.transporter_points
        FROM orders o JOIN offers of ON of.id = o.offer_id WHERE o.id = ?`,
       [order_id]
     )
@@ -46,9 +48,11 @@ router.post('/', auth, async (req, res) => {
     )
     await db.query('UPDATE users SET points_balance = points_balance + 3 WHERE id = ?', [req.user.id])
 
-    // Jei gavėjas vertina transportuotoją — bonus taškai pagal įvertinimą
-    if (target_type === 'transportuotojas' && req.user.role === 'gavejas') {
-      const bonus = rating === 'heart' ? 10 : rating === 'thumb' ? 5 : 0
+    // Bonus taškai transportuotojui pagal emoji (% nuo užsakymo transporter_points)
+    const pct = BONUS_PCT[rating] ?? 0
+    if (pct > 0 && target_type === 'transportuotojas') {
+      const base = order.transporter_points ?? 0
+      const bonus = Math.floor(base * pct / 100)
       if (bonus > 0) {
         await db.query(
           "INSERT INTO points_transactions (user_id, order_id, amount, type) VALUES (?, ?, ?, 'vertinimo_bonus')",
